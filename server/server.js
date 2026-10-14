@@ -26,6 +26,7 @@ app.use(express.json());
 const authRoutes = require('./routes/authRoutes');
 const expenseRoutes = require('./routes/expenseRoutes');
 const budgetRoutes = require('./routes/budgetRoutes');
+const insightRoutes = require('./routes/insightRoutes');
 
 // Base Health Check Route
 app.get('/api/health', (req, res) => {
@@ -45,6 +46,9 @@ app.use('/api/expenses', expenseRoutes);
 
 // Budget routes (CRUD, monthly budget limits)
 app.use('/api/budgets', budgetRoutes);
+
+// Financial Insights routes (unusual, recurring, month-end forecast)
+app.use('/api/insights', insightRoutes);
 
 // 6. Centralized Error Handling Middlewares
 // Catch 404 routes that don't match any registered endpoints

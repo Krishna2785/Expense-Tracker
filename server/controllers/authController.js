@@ -14,15 +14,24 @@ const registerUser = async (req, res, next) => {
     const { name, email, password } = req.body;
 
     // 1. Validate that all required fields are provided
-    if (!name || !email || !password) {
+    if (!name || typeof name !== 'string' || !name.trim() || !email || typeof email !== 'string' || !email.trim() || !password) {
       return res.status(400).json({
         success: false,
         message: 'Please provide all required fields: name, email, and password',
       });
     }
 
+    const trimmedEmail = email.trim().toLowerCase();
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(trimmedEmail)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Please provide a valid email address (e.g. name@example.com)',
+      });
+    }
+
     // 2. Validate password length
-    if (password.length < 6) {
+    if (typeof password !== 'string' || password.length < 6) {
       return res.status(400).json({
         success: false,
         message: 'Password must be at least 6 characters long',
@@ -30,7 +39,7 @@ const registerUser = async (req, res, next) => {
     }
 
     // 3. Check if a user with this email already exists
-    const userExists = await User.findOne({ email });
+    const userExists = await User.findOne({ email: trimmedEmail });
     if (userExists) {
       return res.status(400).json({
         success: false,
@@ -40,8 +49,8 @@ const registerUser = async (req, res, next) => {
 
     // 4. Create new user in MongoDB (the pre-save hook in User model will hash the password)
     const user = await User.create({
-      name,
-      email,
+      name: name.trim(),
+      email: trimmedEmail,
       password,
     });
 

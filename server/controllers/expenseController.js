@@ -2,7 +2,10 @@
 // Controller containing CRUD operations and filtering for user expenses.
 const mongoose = require('mongoose');
 const Expense = require('../models/Expense');
+const MerchantRule = require('../models/MerchantRule');
 const escapeRegex = require('../utils/escapeRegex');
+const { parseSms } = require('../utils/smsParser');
+const { resolveCategory } = require('../utils/categorizer');
 
 /**
  * @desc    Create a new expense or income record
@@ -14,31 +17,65 @@ const createExpense = async (req, res, next) => {
     const { title, amount, category, date, note, type, source } = req.body;
 
     // Validate required fields
-    if (!title || amount === undefined || amount === null) {
+    if (!title || typeof title !== 'string' || !title.trim() || amount === undefined || amount === null) {
       return res.status(400).json({
         success: false,
-        message: 'Please provide both title and amount for the transaction',
+        message: 'Please provide both a valid title and amount for the transaction',
       });
     }
 
-    if (isNaN(Number(amount)) || Number(amount) <= 0) {
+    const numAmount = Number(amount);
+    if (isNaN(numAmount) || numAmount <= 0) {
       return res.status(400).json({
         success: false,
-        message: 'Transaction amount must be a valid number greater than 0',
+        message: 'Transaction amount must be a valid positive number greater than 0',
       });
+    }
+
+    if (type && type !== 'debit' && type !== 'credit') {
+      return res.status(400).json({
+        success: false,
+        message: 'Transaction type must be either "debit" or "credit"',
+      });
+    }
+
+    let parsedDate = new Date();
+    if (date) {
+      parsedDate = new Date(date);
+      if (isNaN(parsedDate.getTime())) {
+        return res.status(400).json({
+          success: false,
+          message: 'Please provide a valid transaction date',
+        });
+      }
     }
 
     // Create the expense document linked strictly to the logged-in user
     const expense = await Expense.create({
       user: req.user.id, // Enforce multi-tenancy isolation
-      title,
-      amount: Number(amount),
-      category: category || 'General',
-      date: date ? new Date(date) : new Date(),
-      note: note || '',
+      title: title.trim(),
+      amount: numAmount,
+      category: category && String(category).trim() ? String(category).trim() : 'General',
+      date: parsedDate,
+      note: note ? String(note).trim() : '',
       type: type || 'debit',
       source: source || 'manual',
     });
+
+    // Auto-save a MerchantRule when the user confirms an SMS-imported expense.
+    // The merchant name is passed as req.body.merchant (set by parseSmsExpense).
+    // This ensures that the EXACT category the user chose is remembered.
+    if (source === 'sms' && req.body.merchant) {
+      const merchantName = String(req.body.merchant).trim();
+      if (merchantName.length > 1) {
+        // findOneAndUpdate with upsert so repeat saves update, not duplicate
+        await MerchantRule.findOneAndUpdate(
+          { user: req.user.id, merchant: { $regex: new RegExp(`^${merchantName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i') } },
+          { user: req.user.id, merchant: merchantName, category: category || 'General' },
+          { upsert: true, new: true, setDefaultsOnInsert: true }
+        );
+      }
+    }
 
     res.status(201).json({
       success: true,
@@ -236,22 +273,51 @@ const updateExpense = async (req, res, next) => {
 
     const { title, amount, category, date, note, type, source } = req.body;
 
-    if (amount !== undefined) {
-      if (isNaN(Number(amount)) || Number(amount) <= 0) {
+    if (title !== undefined) {
+      if (typeof title !== 'string' || !title.trim()) {
         return res.status(400).json({
           success: false,
-          message: 'Transaction amount must be a valid number greater than 0',
+          message: 'Transaction title cannot be empty',
         });
       }
+      expense.title = title.trim();
     }
 
-    // Update only provided fields
-    if (title !== undefined) expense.title = title;
-    if (amount !== undefined) expense.amount = Number(amount);
-    if (category !== undefined) expense.category = category;
-    if (date !== undefined) expense.date = new Date(date);
-    if (note !== undefined) expense.note = note;
-    if (type !== undefined) expense.type = type;
+    if (amount !== undefined) {
+      const numAmount = Number(amount);
+      if (isNaN(numAmount) || numAmount <= 0) {
+        return res.status(400).json({
+          success: false,
+          message: 'Transaction amount must be a valid positive number greater than 0',
+        });
+      }
+      expense.amount = numAmount;
+    }
+
+    if (type !== undefined) {
+      if (type !== 'debit' && type !== 'credit') {
+        return res.status(400).json({
+          success: false,
+          message: 'Transaction type must be either "debit" or "credit"',
+        });
+      }
+      expense.type = type;
+    }
+
+    if (date !== undefined) {
+      const parsedDate = new Date(date);
+      if (isNaN(parsedDate.getTime())) {
+        return res.status(400).json({
+          success: false,
+          message: 'Please provide a valid transaction date',
+        });
+      }
+      expense.date = parsedDate;
+    }
+
+    // Update optional fields
+    if (category !== undefined) expense.category = String(category).trim() || 'General';
+    if (note !== undefined) expense.note = String(note).trim();
     if (source !== undefined) expense.source = source;
 
     const updatedExpense = await expense.save();
@@ -428,6 +494,103 @@ const getExpenseSummary = async (req, res, next) => {
   }
 };
 
+/**
+ * @desc    Parse a raw SMS string and return extracted fields WITHOUT saving
+ * @route   POST /api/expenses/parse-sms
+ * @access  Private
+ *
+ * Body: { text: "<raw SMS string>" }
+ * Returns extracted { amount, merchant, date, type } or a 422 if parsing fails.
+ */
+const parseSmsExpense = async (req, res, next) => {
+  try {
+    const { text } = req.body;
+
+    if (!text || typeof text !== 'string' || text.trim().length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Please provide a non-empty SMS text string in the "text" field.',
+      });
+    }
+
+    const parsed = parseSms(text.trim());
+
+    if (!parsed) {
+      return res.status(422).json({
+        success: false,
+        message:
+          'Could not extract transaction details from this SMS. ' +
+          'The message may be an OTP, promotional, or unsupported bank format.',
+      });
+    }
+
+    // Resolve category: user rule → keyword map → 'General'
+    const category = await resolveCategory(parsed.merchant, req.user.id, MerchantRule);
+
+    // Format date to YYYY-MM-DD for the frontend date input
+    const dateStr = parsed.date
+      ? parsed.date.toISOString().split('T')[0]
+      : new Date().toISOString().split('T')[0];
+
+    res.status(200).json({
+      success: true,
+      message: 'SMS parsed successfully. Review and confirm before saving.',
+      // categorySource tells the UI where the suggestion came from
+      categorySource: category === 'General' ? 'fallback' : 'rule',
+      data: {
+        title: parsed.merchant,
+        amount: parsed.amount,
+        merchant: parsed.merchant, // kept so createExpense can upsert a rule
+        date: dateStr,
+        type: parsed.type,
+        category,
+        source: 'sms',
+        note: '',
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * @desc    Explicitly upsert a MerchantRule (user corrects a category)
+ * @route   POST /api/expenses/merchant-rule
+ * @access  Private
+ *
+ * Body: { merchant: string, category: string }
+ * Idempotent — calling multiple times with the same merchant updates the rule.
+ */
+const upsertMerchantRule = async (req, res, next) => {
+  try {
+    const { merchant, category } = req.body;
+
+    if (!merchant || typeof merchant !== 'string' || merchant.trim().length === 0) {
+      return res.status(400).json({ success: false, message: 'Merchant name is required.' });
+    }
+    if (!category || typeof category !== 'string' || category.trim().length === 0) {
+      return res.status(400).json({ success: false, message: 'Category is required.' });
+    }
+
+    const merchantName = merchant.trim();
+    const safePattern = merchantName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+    const rule = await MerchantRule.findOneAndUpdate(
+      { user: req.user.id, merchant: { $regex: new RegExp(`^${safePattern}$`, 'i') } },
+      { user: req.user.id, merchant: merchantName, category: category.trim() },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+
+    res.status(200).json({
+      success: true,
+      message: `Merchant rule saved: "${merchantName}" → "${category.trim()}"`,
+      data: rule,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
 module.exports = {
   createExpense,
   getExpenses,
@@ -435,4 +598,6 @@ module.exports = {
   updateExpense,
   deleteExpense,
   getExpenseSummary,
+  parseSmsExpense,
+  upsertMerchantRule,
 };

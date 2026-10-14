@@ -16,17 +16,18 @@ const createBudget = async (req, res, next) => {
     const { category, monthlyLimit } = req.body;
 
     // Validate inputs
-    if (!category || monthlyLimit === undefined || monthlyLimit === null) {
+    if (!category || typeof category !== 'string' || !category.trim() || monthlyLimit === undefined || monthlyLimit === null) {
       return res.status(400).json({
         success: false,
-        message: 'Please provide both category and monthlyLimit',
+        message: 'Please provide both a valid category and monthlyLimit',
       });
     }
 
-    if (isNaN(Number(monthlyLimit)) || Number(monthlyLimit) < 0) {
+    const numLimit = Number(monthlyLimit);
+    if (isNaN(numLimit) || numLimit <= 0) {
       return res.status(400).json({
         success: false,
-        message: 'Monthly limit must be a valid number equal to or greater than 0',
+        message: 'Monthly limit must be a valid positive number greater than 0',
       });
     }
 
@@ -190,16 +191,23 @@ const updateBudget = async (req, res, next) => {
     const { category, monthlyLimit } = req.body;
 
     if (monthlyLimit !== undefined) {
-      if (isNaN(Number(monthlyLimit)) || Number(monthlyLimit) < 0) {
+      const numLimit = Number(monthlyLimit);
+      if (isNaN(numLimit) || numLimit <= 0) {
         return res.status(400).json({
           success: false,
-          message: 'Monthly limit must be a valid number equal to or greater than 0',
+          message: 'Monthly limit must be a valid positive number greater than 0',
         });
       }
-      budget.monthlyLimit = Number(monthlyLimit);
+      budget.monthlyLimit = numLimit;
     }
 
     if (category !== undefined) {
+      if (typeof category !== 'string' || !category.trim()) {
+        return res.status(400).json({
+          success: false,
+          message: 'Category cannot be empty',
+        });
+      }
       const safeCategory = escapeRegex(category.trim());
       // Check if updating to a category name that already exists in another budget
       const duplicateCheck = await Budget.findOne({
